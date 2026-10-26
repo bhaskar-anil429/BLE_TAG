@@ -213,7 +213,7 @@
 
 <div class="panel">
   <h2>Firmware update (LTE / OTA)</h2>
-  <div class="row"><label for="otaUrl">Image URL (plain http)</label>
+  <div class="row"><label for="otaUrl">Image URL (http or https)</label>
     <input type="text" id="otaUrl" maxlength="199"
            placeholder="http://your-server/firmware.bin"></div>
   <div class="row">
@@ -221,7 +221,7 @@
   </div>
   <div class="row"><span id="otaState" class="pemstate">Sends {"cmd":"ota_ready","url":…} — the same command as the
   MQTT CMD topic. The device downloads the image over LTE at the end of its next publish cycle, then reboots
-  into it. Use plain http (the modem won't follow https redirects). The same URL is allowed 3 attempts per
+  into it. Use a direct http or https link to the .bin (redirects are not followed; GitHub raw links work). The same URL is allowed 3 attempts per
   device; after that, change the URL.</span></div>
 </div>
 
@@ -708,6 +708,10 @@ function smpFrame(op, group, id, payload) {
  * does. No pacing: the 2026-10-08 "renderer freeze" blamed on write bursts
  * was really cborDec spinning on indefinite-length replies. If Chrome's
  * write queue is momentarily full the write rejects — back off and retry. */
+/* Per-slice delay (ms). 0 = full speed; fwUpload switches to slow mode after
+ * the first lost/rejected frame, for links that drop bursts of writes. */
+let smpSliceDelay = 0;
+
 async function smpWrite(f) {
   for (let i = 0; i < f.length; i += 180) {
     for (let tries = 0; ; tries++) {
@@ -717,7 +721,30 @@ async function smpWrite(f) {
         await new Promise(res => setTimeout(res, 20));
       }
     }
+    if (smpSliceDelay) await new Promise(res => setTimeout(res, smpSliceDelay));
   }
+}
+
+/* Drop and re-open the BLE link, then wait for the auto-reconnect. A lost
+ * write-without-response slice leaves the device's SMP reassembly buffer
+ * holding a partial frame, so every later frame is misaligned and fails;
+ * disconnecting is the only way to clear it. The image upload state on the
+ * device survives, so the upload resumes from the device's offset. */
+async function smpResync() {
+  smpPending = null; smpRx = null; chSmp = null;
+  try { dev.gatt.disconnect(); } catch (e) { /* already down */ }
+  const t0 = Date.now();
+  let sawDown = !dev.gatt.connected;
+  while (Date.now() - t0 < 30000) {
+    await new Promise(res => setTimeout(res, 500));
+    if (!dev.gatt.connected) sawDown = true;
+    if (sawDown && dev.gatt.connected && $('status').className === 'on') {
+      $('btnFw').disabled = true;   /* upload still running */
+      await new Promise(res => setTimeout(res, 800));   /* let discovery settle */
+      return;
+    }
+  }
+  throw new Error('link did not come back after resync (is the config window still open?)');
 }
 
 async function smpRequest(op, group, id, payload, timeoutMs) {
@@ -773,7 +800,9 @@ async function fwUpload() {
   $('fwProg').hidden = false; $('fwProg').value = 0;
   try {
     log(`uploading ${file.name} (${bytes.length} B) ...`, 'sys');
-    let off = 0, frames = 0, nextPct = 2;
+    let off = 0, frames = 0, nextPct = 2, fails = 0;
+    const MAX_FAILS = 8;   /* consecutive lost/rejected frames before giving up */
+    smpSliceDelay = 0;
     const t0 = Date.now();
     while (off < bytes.length) {
       /* Big frames like the PC tool: ~2.4 KB of image per SMP request, sent
@@ -784,14 +813,34 @@ async function fwUpload() {
       const payload = off === 0
         ? { data: bytes.subarray(0, n), off: 0, len: bytes.length }
         : { data: bytes.subarray(off, off + n), off };
-      let r;
+      /* A frame that gets no reply, or that the device rejects (it answers
+       * with the offset it really has), means slices were lost on the air.
+       * Resume instead of restarting: reconnect to clear the device's
+       * half-received frame, slow the slices down, and resend from the
+       * device's offset. (2026-10-26: customer upload restarted from 0 on
+       * every error and never finished.) */
+      let r = null, why = '';
       try {
         r = await smpRequest(2, 1, 1, payload, 15000);
       } catch (e) {
-        throw new Error(`no reply to the frame at offset ${off} of ${bytes.length} ` +
-                        `after ${((Date.now() - t0) / 1000).toFixed(0)} s (${e.message})`);
+        if (/^SMP rc=/.test(e.message)) throw new Error(`device refused the image at offset ${off} (${e.message})`);
+        why = `no reply (${e.message})`;
       }
-      const newOff = (r && typeof r.off === 'number') ? r.off : off + n;
+      const newOff = (r && typeof r.off === 'number') ? r.off : (r ? off + n : off);
+      if (!r || newOff <= off) {
+        if (r) why = `device is at offset ${newOff}`;
+        if (++fails > MAX_FAILS) {
+          throw new Error(`gave up at offset ${off} of ${bytes.length} after ${MAX_FAILS} retries ` +
+                          `(${why}) — move closer to the device or use the LTE update below`);
+        }
+        log(`  frame at ${off} lost: ${why} — reconnecting and resuming (retry ${fails}/${MAX_FAILS}, slow mode)`, 'err');
+        smpSliceDelay = 12;
+        if (r && newOff < off) off = newOff;   /* go back to where the device is */
+        await smpResync();
+        continue;
+      }
+      fails = 0;
+      off = newOff;
       if (newOff <= off) throw new Error(`no progress at offset ${off}`);
       off = newOff;
       frames++;
@@ -827,6 +876,7 @@ async function fwUpload() {
   } catch (e) { log(`firmware update failed: ${e.message}`, 'err'); }
   finally {
     $('fwProg').hidden = true;
+    smpSliceDelay = 0;
     $('btnFw').disabled = false;
   }
 }
@@ -870,7 +920,6 @@ $('btnOta').onclick = async () => {
     log('OTA: URL must start with http and be under 200 characters', 'err');
     return;
   }
-  if (url.startsWith('https')) log('OTA: https URL — the modem may fail the download; plain http is preferred', 'sys');
   try {
     const r = await sendCmd({ cmd: 'ota_ready', url });
     if (r && r.resp === 0) {
